@@ -516,6 +516,8 @@ def test_cli_all_expected_top_level_commands_registered() -> None:
         "udev-uninstall",
         "set-target",
         "monitor",
+        "flash",
+        "projects",
     ):
         assert cmd in result.output, f"missing top-level command: {cmd}"
 

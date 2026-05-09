@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 import click
-from fastapi import FastAPI, HTTPException, Response, WebSocket
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -46,6 +46,16 @@ from .devices import (
     unregister_device,
     update_device,
 )
+from .flash import (
+    FlashConflictError,
+    FlashError,
+    FlashJob,
+    channel_for as flash_channel_for,
+    list_jobs as list_flash_jobs,
+    manager as flash_manager,
+    read_job as read_flash_job,
+    trigger_flash,
+)
 from .monitor import (
     LogPathError,
     MonitorConfig,
@@ -53,6 +63,16 @@ from .monitor import (
     list_log_files,
     registry as monitor_registry,
     resolve_log_file,
+)
+from .projects import (
+    ProjectError,
+    ProjectListItem,
+    ProjectMeta,
+    ProjectNotFoundError,
+    delete_project,
+    list_projects,
+    load_project_meta,
+    upload_project,
 )
 from .ws import WebSocketDisconnect, manager
 
@@ -76,6 +96,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.started_at = time.monotonic()
     app.state.settings = settings
     app.state.version = _resolve_version()
+    # Lifespan runs once per app — these are the only places the dirs are
+    # guaranteed to exist before any request hits us.
+    settings.projects_dir.mkdir(parents=True, exist_ok=True)
+    settings.flash_jobs_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
         "teletop starting host=%s port=%d data_dir=%s web_dist=%s",
         settings.host,
@@ -84,7 +108,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.web_dist_dir,
     )
     yield
-    logger.info("teletop shutting down — stopping serial monitors")
+    logger.info("teletop shutting down — draining flash jobs + serial monitors")
+    await flash_manager.stop_all()
     await monitor_registry.stop_all()
 
 
@@ -113,6 +138,10 @@ class MonitorStartBody(BaseModel):
     baudrate: int | None = None
 
 
+class FlashStartBody(BaseModel):
+    project: str
+
+
 # ── Monitor helpers (used by REST + CLI) ─────────────────────────────────
 
 
@@ -136,6 +165,16 @@ def _resolve_alias_for_monitor(alias: str) -> tuple[str, str]:
             detail=f"device {alias!r} is not connected — plug it in or check udev",
         )
     return device_path, status.target_chip
+
+
+def _resolve_alias_for_flash(alias: str) -> tuple[str, str]:
+    """Same precondition as monitor: alias known + currently connected.
+
+    Returns ``(device_path, target_chip)`` so the flash command knows which
+    --chip to pass — the registry is the source of truth here, not the
+    project's hint.
+    """
+    return _resolve_alias_for_monitor(alias)
 
 
 def _monitor_summary(alias: str) -> dict[str, object]:
@@ -339,6 +378,119 @@ def create_app() -> FastAPI:
                 "Content-Disposition": f'attachment; filename="{path.name}"'
             },
         )
+
+    # ── Project endpoints ────────────────────────────────────────────────
+
+    @app.post("/api/projects/{name}/upload")
+    async def api_project_upload(
+        name: str, archive: UploadFile = File(...)
+    ) -> ProjectMeta:
+        settings = app.state.settings
+        body = await archive.read()
+        try:
+            return upload_project(
+                settings.projects_dir,
+                name,
+                body,
+                max_size_mb=settings.max_archive_size_mb,
+            )
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/projects")
+    async def api_projects_list() -> list[ProjectListItem]:
+        settings = app.state.settings
+        return list_projects(settings.projects_dir)
+
+    @app.get("/api/projects/{name}")
+    async def api_project_show(name: str) -> dict[str, object]:
+        settings = app.state.settings
+        try:
+            meta = load_project_meta(settings.projects_dir, name)
+        except ProjectNotFoundError:
+            raise HTTPException(status_code=404, detail=f"project {name!r} not found")
+        except ProjectError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        # Surface the full file inventory alongside meta — the project show
+        # endpoint is the natural place for "what's in this build".
+        files = [ff.model_dump() for ff in meta.flash_files]
+        return {**meta.model_dump(mode="json"), "files": files}
+
+    @app.delete("/api/projects/{name}", status_code=204)
+    async def api_project_delete(name: str) -> Response:
+        settings = app.state.settings
+        try:
+            delete_project(settings.projects_dir, name)
+        except ProjectNotFoundError:
+            raise HTTPException(status_code=404, detail=f"project {name!r} not found")
+        return Response(status_code=204)
+
+    # ── Flash endpoints ──────────────────────────────────────────────────
+
+    @app.post("/api/flash/{alias}", status_code=202)
+    async def api_flash_start(alias: str, body: FlashStartBody) -> dict[str, object]:
+        settings = app.state.settings
+        device_path, target_chip = _resolve_alias_for_flash(alias)
+        try:
+            job, _task = await trigger_flash(
+                alias=alias,
+                project=body.project,
+                target_chip=target_chip,
+                device_path=device_path,
+                projects_root=settings.projects_dir,
+                jobs_dir=settings.flash_jobs_dir,
+            )
+        except ProjectNotFoundError:
+            raise HTTPException(
+                status_code=404, detail=f"project {body.project!r} not found"
+            )
+        except FlashConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except FlashError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "job_id": job.job_id,
+            "alias": job.alias,
+            "project": job.project,
+            "target_chip": job.target_chip,
+            "started_at": job.started_at.isoformat().replace("+00:00", "Z"),
+            "status": job.status,
+        }
+
+    @app.get("/api/flash/jobs")
+    async def api_flash_jobs(limit: int = 20) -> list[dict[str, object]]:
+        settings = app.state.settings
+        jobs = list_flash_jobs(settings.flash_jobs_dir, limit=limit)
+        return [j.to_json() for j in jobs]
+
+    @app.get("/api/flash/jobs/{job_id}")
+    async def api_flash_job_show(job_id: str) -> dict[str, object]:
+        settings = app.state.settings
+        try:
+            job = read_flash_job(settings.flash_jobs_dir, job_id)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=404, detail=f"flash job {job_id!r} not found"
+            )
+        return job.to_json()
+
+    @app.websocket("/ws/flash/{alias}")
+    async def ws_flash(websocket: WebSocket, alias: str) -> None:
+        channel = flash_channel_for(alias)
+        await manager.connect(websocket, channel)
+        try:
+            running = flash_manager.is_active(alias)
+            await websocket.send_json({
+                "type": "flash_status",
+                "alias": alias,
+                "state": "running" if running else "idle",
+            })
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await manager.disconnect(websocket, channel)
 
     # Static SPA mount must come AFTER all API/WS routes — it's a catch-all.
     settings = get_settings()
@@ -1021,6 +1173,324 @@ def monitor_tail_cmd(alias: str) -> None:
         asyncio.run(_tail(alias))
     except KeyboardInterrupt:
         Console().print("[dim]\n^C — exiting[/dim]")
+
+
+# ── projects commands ───────────────────────────────────────────────────
+
+
+def _http_request_multipart(
+    path: str, *, files: dict[str, tuple[str, bytes, str]]
+) -> tuple[int, object]:
+    """POST a multipart/form-data body. Used for project upload."""
+    import httpx
+
+    url = _server_base_url() + path
+    try:
+        # Larger timeout — uploads + extraction can take a few seconds for
+        # multi-MB images.
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(url, files=files)
+    except httpx.ConnectError as exc:
+        raise click.ClickException(
+            f"could not reach server at {url} — is `teletop-server serve` running?\n"
+            f"  ({exc})"
+        )
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, r.text
+
+
+def _build_project_tarball(build_path: Path) -> bytes:
+    """Tar+gzip ``build_path`` so the archive root holds flasher_args.json."""
+    import io
+    import tarfile as _tarfile
+
+    if not build_path.is_dir():
+        raise click.ClickException(f"not a directory: {build_path}")
+    if not (build_path / "flasher_args.json").is_file():
+        raise click.ClickException(
+            f"{build_path} has no flasher_args.json — pass the build/ dir, not the project root"
+        )
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        # arcname='.' so flasher_args.json sits at the archive root, matching
+        # the server's preferred shape.
+        tf.add(str(build_path), arcname=".")
+    return buf.getvalue()
+
+
+@cli.group()
+def projects() -> None:
+    """Manage uploaded firmware project bundles."""
+
+
+@projects.command("upload")
+@click.argument("name")
+@click.argument(
+    "build_path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+def projects_upload_cmd(name: str, build_path: Path) -> None:
+    """Tar BUILD_PATH and upload it to the server as project NAME."""
+    console = Console()
+    console.print(f"[dim]packing[/dim] {build_path}")
+    blob = _build_project_tarball(build_path)
+    size_mib = len(blob) / (1024 * 1024)
+    console.print(f"[dim]uploading[/dim] {size_mib:.2f} MiB → {name}")
+    status, payload = _http_request_multipart(
+        f"/api/projects/{name}/upload",
+        files={"archive": (f"{name}.tar.gz", blob, "application/gzip")},
+    )
+    if status >= 400:
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    assert isinstance(payload, dict)
+    console.print(
+        f"[green]uploaded[/green] {payload.get('name')} "
+        f"target_chip_hint={payload.get('target_chip_hint') or '—'} "
+        f"files={len(payload.get('flash_files', []))}"
+    )
+
+
+@projects.command("list")
+def projects_list_cmd() -> None:
+    """Show every uploaded project (newest first)."""
+    console = Console()
+    status, payload = _http_request("GET", "/api/projects")
+    if status >= 400 or not isinstance(payload, list):
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    if not payload:
+        console.print("[dim]no projects uploaded yet[/dim]")
+        return
+    table = Table(title="Projects")
+    table.add_column("name")
+    table.add_column("target hint")
+    table.add_column("files")
+    table.add_column("size")
+    table.add_column("uploaded (UTC)")
+    for row in payload:
+        size_h = _human_bytes(int(row.get("total_size", 0)))
+        table.add_row(
+            str(row.get("name", "?")),
+            str(row.get("target_chip_hint") or "—"),
+            str(row.get("file_count", 0)),
+            size_h,
+            str(row.get("uploaded_at", "?")),
+        )
+    console.print(table)
+
+
+@projects.command("show")
+@click.argument("name")
+def projects_show_cmd(name: str) -> None:
+    """Print meta.json + file inventory for project NAME."""
+    console = Console()
+    status, payload = _http_request("GET", f"/api/projects/{name}")
+    if status == 404:
+        console.print(f"[red]error:[/red] project {name!r} not found")
+        sys.exit(1)
+    if status >= 400 or not isinstance(payload, dict):
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    import json as _json
+
+    console.print_json(_json.dumps(payload))
+
+
+@projects.command("delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def projects_delete_cmd(name: str, yes: bool) -> None:
+    """Remove project NAME from disk."""
+    console = Console()
+    if not yes and not click.confirm(f"Delete project {name!r}?", default=False):
+        console.print("[yellow]aborted[/yellow]")
+        return
+    status, payload = _http_request("DELETE", f"/api/projects/{name}")
+    if status == 404:
+        console.print(f"[red]error:[/red] project {name!r} not found")
+        sys.exit(1)
+    if status >= 400:
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    console.print(f"[green]deleted[/green] {name}")
+
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f} TiB"  # type: ignore[unreachable]
+
+
+# ── flash commands ──────────────────────────────────────────────────────
+
+
+async def _tail_flash(alias: str) -> None:
+    """Stream live flash events for ALIAS to stdout via WebSocket."""
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+
+    console = Console()
+    url = f"{_ws_base_url()}/ws/flash/{alias}"
+    try:
+        async with websockets.connect(url) as ws:
+            console.print(f"[dim]connected to {url} (Ctrl+C to detach)[/dim]")
+            async for raw in ws:
+                try:
+                    import json as _json
+
+                    evt = _json.loads(raw)
+                except ValueError:
+                    console.print(f"[dim]{raw}[/dim]")
+                    continue
+                etype = evt.get("type")
+                if etype == "flash_line":
+                    console.print(evt.get("text", ""))
+                elif etype == "flash_status":
+                    state = evt.get("state", "?")
+                    extra = evt.get("error") or ""
+                    color = {
+                        "running": "cyan",
+                        "success": "green",
+                        "error": "red",
+                        "monitor_paused": "yellow",
+                        "monitor_resumed": "yellow",
+                        "monitor_resume_failed": "red",
+                        "idle": "dim",
+                    }.get(state, "cyan")
+                    suffix = f" — {extra}" if extra else ""
+                    console.print(f"[{color}]●[/{color}] {state}{suffix}")
+                    if state in ("success", "error"):
+                        # Job ended; the runner will broadcast monitor_resumed
+                        # *after* this — keep listening so it lands on screen.
+                        pass
+                else:
+                    console.print(f"[dim]{evt}[/dim]")
+    except ConnectionClosed:
+        console.print("[dim]connection closed[/dim]")
+    except OSError as exc:
+        raise click.ClickException(
+            f"could not reach {url} — is `teletop-server serve` running?\n  ({exc})"
+        )
+
+
+@cli.group()
+def flash() -> None:
+    """Flash uploaded projects onto registered devices."""
+
+
+@flash.command("run")
+@click.argument("alias")
+@click.argument("project")
+def flash_run_cmd(alias: str, project: str) -> None:
+    """Trigger a flash of PROJECT to ALIAS and tail the output."""
+    import asyncio
+
+    console = Console()
+    status, payload = _http_request(
+        "POST", f"/api/flash/{alias}", json_body={"project": project}
+    )
+    if status == 404:
+        console.print(f"[red]error[/red]: {payload}")
+        sys.exit(1)
+    if status == 409:
+        console.print(f"[yellow]conflict[/yellow]: {payload}")
+        sys.exit(1)
+    if status >= 400:
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    assert isinstance(payload, dict)
+    console.print(
+        f"[green]flash queued[/green] job_id={payload.get('job_id')} "
+        f"alias={alias} project={project} target={payload.get('target_chip')}"
+    )
+    try:
+        asyncio.run(_tail_flash(alias))
+    except KeyboardInterrupt:
+        Console().print("[dim]\n^C — detaching from tail (job continues)[/dim]")
+
+
+@flash.command("jobs")
+@click.option("--limit", type=int, default=20, help="How many recent jobs to show.")
+def flash_jobs_cmd(limit: int) -> None:
+    """Show the most recent flash jobs."""
+    console = Console()
+    status, payload = _http_request("GET", f"/api/flash/jobs?limit={limit}")
+    if status >= 400 or not isinstance(payload, list):
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    if not payload:
+        console.print("[dim]no flash jobs yet[/dim]")
+        return
+    table = Table(title=f"Recent flash jobs (n={len(payload)})")
+    table.add_column("job_id")
+    table.add_column("alias")
+    table.add_column("project")
+    table.add_column("status")
+    table.add_column("rc")
+    table.add_column("duration")
+    table.add_column("started (UTC)")
+    for row in payload:
+        rc = row.get("return_code")
+        st = str(row.get("status", "?"))
+        color = {"success": "green", "error": "red", "running": "cyan"}.get(st, "yellow")
+        duration = "—"
+        if row.get("finished_at") and row.get("started_at"):
+            try:
+                from datetime import datetime as _dt
+
+                start = _dt.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                end = _dt.fromisoformat(row["finished_at"].replace("Z", "+00:00"))
+                duration = f"{(end - start).total_seconds():.1f}s"
+            except Exception:  # pragma: no cover — defensive
+                pass
+        table.add_row(
+            str(row.get("job_id", "?"))[:12],
+            str(row.get("alias", "?")),
+            str(row.get("project", "?")),
+            f"[{color}]{st}[/{color}]",
+            "—" if rc is None else str(rc),
+            duration,
+            str(row.get("started_at", "?")),
+        )
+    console.print(table)
+
+
+@flash.command("show")
+@click.argument("job_id")
+@click.option("--cmd", "show_cmd", is_flag=True, help="Print the esptool argv list.")
+def flash_show_cmd(job_id: str, show_cmd: bool) -> None:
+    """Print details for a single flash job."""
+    console = Console()
+    status, payload = _http_request("GET", f"/api/flash/jobs/{job_id}")
+    if status == 404:
+        console.print(f"[red]error:[/red] job {job_id!r} not found")
+        sys.exit(1)
+    if status >= 400 or not isinstance(payload, dict):
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    if not show_cmd:
+        # Drop the very long cmd by default; --cmd shows it.
+        payload = {k: v for k, v in payload.items() if k != "cmd"}
+    import json as _json
+
+    console.print_json(_json.dumps(payload))
+
+
+@flash.command("tail")
+@click.argument("alias")
+def flash_tail_cmd(alias: str) -> None:
+    """Attach to ALIAS's flash channel and stream events."""
+    import asyncio
+
+    try:
+        asyncio.run(_tail_flash(alias))
+    except KeyboardInterrupt:
+        Console().print("[dim]\n^C — detaching[/dim]")
 
 
 if __name__ == "__main__":

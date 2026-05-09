@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     default_baudrate: int = 115200
     monitor_queue_size: int = 1000
 
+    # Task 6 — project bundles + flash job history live alongside the registry.
+    projects_dir: Path = Path.home() / "teletop" / "projects"
+    flash_jobs_dir: Path = Path.home() / "teletop" / "flash_jobs"
+    max_archive_size_mb: int = 50
+
 
 def get_settings() -> Settings:
     return Settings()
