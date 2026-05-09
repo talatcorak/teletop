@@ -23,12 +23,16 @@ from rich.table import Table
 from . import __version__ as fallback_version
 from .config import Settings, get_settings
 from .devices import (
+    DEFAULT_TARGET_CHIP,
+    TARGET_CHIPS,
     UDEV_RULES_PATH,
     DeviceRegistration,
     DeviceRegistryError,
     DeviceStatus,
     DiscoveredPort,
     DiscoveredPortWithRegistration,
+    TargetChip,
+    detect_target_chip,
     discover_ports,
     discover_with_registrations,
     generate_udev_rules,
@@ -40,6 +44,7 @@ from .devices import (
     symlink_for,
     uninstall_udev_rules,
     unregister_device,
+    update_device,
 )
 from .ws import WebSocketDisconnect, manager
 
@@ -79,11 +84,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 class DeviceCreate(BaseModel):
     alias: str
+    target_chip: TargetChip
     serial_number: str | None = None
     usb_port: str | None = None
     notes: str | None = None
     vid: int | None = None
     pid: int | None = None
+    usb_chip: str | None = None
+
+
+class DeviceUpdate(BaseModel):
+    """PATCH body — only target_chip and notes are mutable here."""
+
+    target_chip: TargetChip | None = None
+    notes: str | None = None
 
 
 # ── App factory ──────────────────────────────────────────────────────────
@@ -127,14 +141,25 @@ def create_app() -> FastAPI:
         try:
             return register_device(
                 body.alias,
+                target_chip=body.target_chip,
                 serial_number=body.serial_number,
                 usb_port=body.usb_port,
                 vid=body.vid,
                 pid=body.pid,
+                usb_chip=body.usb_chip,
                 notes=body.notes,
             )
         except DeviceRegistryError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.patch("/api/devices/{alias}")
+    async def api_update(alias: str, body: DeviceUpdate) -> DeviceRegistration:
+        try:
+            return update_device(
+                alias, target_chip=body.target_chip, notes=body.notes
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"alias {alias!r} not found")
 
     @app.delete("/api/devices/{alias}", status_code=204)
     async def api_unregister(alias: str) -> Response:
@@ -226,7 +251,7 @@ def discover(show_all: bool) -> None:
     table = Table(title="Discovered serial ports")
     table.add_column("device")
     table.add_column("VID:PID")
-    table.add_column("chip")
+    table.add_column("usb_chip")
     table.add_column("identity")
     table.add_column("status")
     table.add_column("description", overflow="fold")
@@ -234,12 +259,14 @@ def discover(show_all: bool) -> None:
     for port in ports:
         reg = match_registration(port, registry)
         status = (
-            f"[green]registered → {reg.alias}[/green]" if reg else "[dim]free[/dim]"
+            f"[green]{reg.alias} ({reg.target_chip})[/green]"
+            if reg
+            else "[dim]free[/dim]"
         )
         table.add_row(
             port.device,
             _vid_pid(port.vid, port.pid),
-            port.chip or "—",
+            port.usb_chip or "—",
             _identity_str(port),
             status,
             port.description or "",
@@ -257,8 +284,57 @@ def _parse_hex_int(ctx: click.Context, param: click.Parameter, value: str | None
         raise click.BadParameter(f"{value!r} is not a valid integer")
 
 
+def _resolve_target_chip(
+    *,
+    target: str | None,
+    detect: bool,
+    device_path: str | None,
+    interactive: bool,
+    console: Console,
+) -> TargetChip:
+    """Decide which TargetChip to record. Exits with 1 on unrecoverable errors."""
+    if target:
+        return target  # type: ignore[return-value]
+    if detect:
+        if not device_path:
+            console.print(
+                "[red]error:[/red] --detect needs a connected device matching the identity"
+            )
+            sys.exit(1)
+        try:
+            chip = detect_target_chip(device_path)
+        except (subprocess.TimeoutExpired, RuntimeError, FileNotFoundError) as exc:
+            console.print(f"[yellow]auto-detect failed:[/yellow] {exc}")
+            if not interactive:
+                sys.exit(1)
+        else:
+            console.print(f"[cyan]detected target:[/cyan] {chip}")
+            return chip
+    if interactive:
+        return click.prompt(
+            "Target chip",
+            type=click.Choice(TARGET_CHIPS),
+            default=DEFAULT_TARGET_CHIP,
+        )
+    console.print(
+        "[red]error:[/red] one of --target / --detect is required for non-interactive register"
+    )
+    sys.exit(1)
+
+
 @cli.command()
 @click.argument("alias")
+@click.option(
+    "--target",
+    type=click.Choice(TARGET_CHIPS),
+    default=None,
+    help="Target ESP chip family (e.g. esp32, esp8266, esp32s3).",
+)
+@click.option(
+    "--detect",
+    is_flag=True,
+    help="Auto-detect target via `esptool.py chip_id` (briefly bounces device into bootloader).",
+)
 @click.option("--serial", "serial_number", default=None, help="Pin to USB serial number.")
 @click.option("--port", "usb_port", default=None, help="Pin to USB port path (e.g. 3-1).")
 @click.option(
@@ -278,6 +354,8 @@ def _parse_hex_int(ctx: click.Context, param: click.Parameter, value: str | None
 )
 def register(
     alias: str,
+    target: str | None,
+    detect: bool,
     serial_number: str | None,
     usb_port: str | None,
     vid: int | None,
@@ -290,14 +368,37 @@ def register(
     Without --serial/--port, the command lists currently connected ports and
     prompts you to pick one. The chosen port's identity is recorded — serial
     number when available (e.g. CP210x boards), otherwise the USB port path
-    (CH340 boards).
+    (CH340 boards). The target ESP chip family is captured separately:
+    pass --target, --detect, or answer the interactive prompt.
     """
     console = Console()
 
+    # ── Non-interactive flag path ────────────────────────────────────────
     if serial_number or usb_port:
+        device_path: str | None = None
+        if detect:
+            ports = discover_ports(esp_only=not show_all)
+            match = next(
+                (
+                    p
+                    for p in ports
+                    if (serial_number and p.serial_number == serial_number)
+                    or (not serial_number and p.usb_port == usb_port)
+                ),
+                None,
+            )
+            device_path = match.device if match else None
+        target_chip = _resolve_target_chip(
+            target=target,
+            detect=detect,
+            device_path=device_path,
+            interactive=False,
+            console=console,
+        )
         try:
             reg = register_device(
                 alias,
+                target_chip=target_chip,
                 serial_number=serial_number,
                 usb_port=usb_port,
                 vid=vid,
@@ -307,12 +408,16 @@ def register(
         except DeviceRegistryError as exc:
             console.print(f"[red]error:[/red] {exc}")
             sys.exit(1)
-        console.print(
-            f"[green]registered[/green] {alias} via "
-            f"{'serial=' + reg.serial_number if reg.serial_number else 'usb_port=' + (reg.usb_port or '?')}"
-            f" (chip={reg.chip or 'unknown'})"
+        identity = (
+            f"serial={reg.serial_number}"
+            if reg.serial_number
+            else f"usb_port={reg.usb_port or '?'}"
         )
-        if (reg.vid is None or reg.pid is None):
+        console.print(
+            f"[green]registered[/green] {alias} ({reg.target_chip}, "
+            f"usb={reg.usb_chip or 'unknown'}) via {identity}"
+        )
+        if reg.vid is None or reg.pid is None:
             console.print(
                 "[yellow]warning:[/yellow] no VID/PID — udev rule generation "
                 "will skip this entry. Pass --vid/--pid or re-register interactively."
@@ -320,6 +425,7 @@ def register(
         _maybe_offer_udev_reinstall(console)
         return
 
+    # ── Interactive path ─────────────────────────────────────────────────
     ports = discover_ports(esp_only=not show_all)
     if not ports:
         console.print("[red]No ports detected.[/red] Plug in a device or use --all.")
@@ -329,7 +435,7 @@ def register(
     for i, port in enumerate(ports):
         console.print(
             f"  [{i}] {port.device}  {_vid_pid(port.vid, port.pid)}  "
-            f"chip={port.chip or '—'}  {_identity_str(port)}"
+            f"usb_chip={port.usb_chip or '—'}  {_identity_str(port)}"
         )
 
     idx = click.prompt("Select port", type=click.IntRange(0, len(ports) - 1))
@@ -346,13 +452,24 @@ def register(
             "this chip exposes no serial; keep the device in this physical socket."
         )
 
+    target_chip = _resolve_target_chip(
+        target=target,
+        detect=detect,
+        device_path=chosen.device,
+        interactive=True,
+        console=console,
+    )
+
     try:
-        reg = register_device(alias, port=chosen, notes=notes)
+        reg = register_device(alias, port=chosen, target_chip=target_chip, notes=notes)
     except DeviceRegistryError as exc:
         console.print(f"[red]error:[/red] {exc}")
         sys.exit(1)
 
-    console.print(f"[green]registered[/green] {alias} ({reg.chip or 'unknown chip'})")
+    console.print(
+        f"[green]registered[/green] {alias} "
+        f"(target={reg.target_chip}, usb={reg.usb_chip or 'unknown'})"
+    )
     _maybe_offer_udev_reinstall(console)
 
 
@@ -386,7 +503,8 @@ def list_cmd() -> None:
     table = Table(title="Registered devices")
     table.add_column("alias")
     table.add_column("identity")
-    table.add_column("chip")
+    table.add_column("target")
+    table.add_column("usb_chip")
     table.add_column("connected")
     table.add_column("current device")
     table.add_column("symlink")
@@ -397,13 +515,29 @@ def list_cmd() -> None:
         table.add_row(
             s.alias,
             identity,
-            s.chip or "—",
+            s.target_chip,
+            s.usb_chip or "—",
             connected,
             s.current_device or "—",
             s.udev_symlink or "—",
         )
 
     console.print(table)
+
+
+@cli.command(name="set-target")
+@click.argument("alias")
+@click.argument("target", type=click.Choice(TARGET_CHIPS))
+def set_target_cmd(alias: str, target: str) -> None:
+    """Update the target ESP chip for an already-registered ALIAS."""
+    console = Console()
+    try:
+        reg = update_device(alias, target_chip=target)  # type: ignore[arg-type]
+    except KeyError:
+        console.print(f"[red]error:[/red] alias {alias!r} not registered")
+        sys.exit(1)
+    console.print(f"[green]updated[/green] {alias} target_chip → {reg.target_chip}")
+    _maybe_offer_udev_reinstall(console)
 
 
 # ── udev commands ────────────────────────────────────────────────────────

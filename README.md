@@ -46,6 +46,27 @@ Server `TELETOP_*` env vars ile yapılandırılır:
 - `TELETOP_DATA_DIR` (default `~/teletop`)
 - `TELETOP_AUTH_TOKEN` (Task 12'den itibaren zorunlu)
 
+## Breaking change in 0.2 — multi-chip support
+
+`DeviceRegistration` artık iki ayrı chip alanı tutuyor:
+
+- `usb_chip` — USB-UART converter (önceki `chip` alanı; CH340, CP2102, ...)
+- `target_chip` — flash hedefi ESP ailesi (`esp32` / `esp8266` / `esp32s2` / `esp32s3` / `esp32c3` / `esp32c6` / `esp32h2`), **zorunlu**
+
+0.2'den önce kaydedilmiş cihazlar `load_registry()` sırasında otomatik migrate ediliyor: `chip → usb_chip` ve eksik `target_chip = "esp32"` (uyarıyla, sonra persist). Yanlışsa düzelt:
+
+```bash
+uv run teletop-server set-target agv1 esp8266
+```
+
+Stable symlink prefix de değişti: `/dev/esp32-<alias>` → `/dev/tty-<alias>`. Yeni symlink'leri oluşturmak için:
+
+```bash
+sudo $(which uv) run teletop-server udev-install
+```
+
+`udevadm trigger` eski `/dev/esp32-*` symlink'lerini düşürmezse bir `sudo udevadm trigger --action=change` veya reboot çözer.
+
 ## Raspberry Pi initial setup
 
 İlk kurulum için RPi'da sırayla:
@@ -65,15 +86,18 @@ sudo bash server/scripts/setup-rpi.sh
 
 # 5. Cihazları kaydet
 cd server
-uv run teletop-server discover                 # önce kuru tarama
-uv run teletop-server register agv1            # interaktif (önerilen)
-# veya: uv run teletop-server register agv1 --port 3-1 --vid 0x1A86 --pid 0x7523
+uv run teletop-server discover                            # önce kuru tarama
+uv run teletop-server register agv1                       # interaktif: target chip prompt'u sorar
+# veya non-interaktif:
+#   uv run teletop-server register agv1 --port 3-1 --vid 0x1A86 --pid 0x7523 --target esp8266
+# auto-detect:
+#   uv run teletop-server register agv1 --port 3-1 --vid 0x1A86 --pid 0x7523 --detect
 
-# 6. udev rule'larını yükle (cihazları stable /dev/esp32-<alias> olarak görünür yapar)
+# 6. udev rule'larını yükle (cihazları stable /dev/tty-<alias> olarak görünür yapar)
 sudo $(which uv) run teletop-server udev-install
 
 # 7. Doğrula
-ls -l /dev/esp32-*
+ls -l /dev/tty-*
 uv run teletop-server list
 ```
 

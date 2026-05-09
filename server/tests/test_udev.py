@@ -76,7 +76,8 @@ def _reg(
     usb_port: str | None = None,
     vid: int | None = None,
     pid: int | None = None,
-    chip: str | None = None,
+    usb_chip: str | None = None,
+    target_chip: str = "esp32",
 ) -> DeviceRegistration:
     return DeviceRegistration(
         alias=alias,
@@ -84,7 +85,8 @@ def _reg(
         usb_port=usb_port,
         vid=vid,
         pid=pid,
-        chip=chip,
+        usb_chip=usb_chip,
+        target_chip=target_chip,  # type: ignore[arg-type]
         created_at=datetime.now(timezone.utc),
     )
 
@@ -104,14 +106,14 @@ def test_validate_alias_rejects_special_chars() -> None:
 
 
 def test_validate_alias_rejects_leading_dash() -> None:
-    """A leading '-' would make /dev/esp32--foo a flag-like path."""
+    """A leading '-' would make /dev/tty--foo a flag-like path."""
     with pytest.raises(DeviceRegistryError):
         validate_alias("-bad")
 
 
 def test_register_device_rejects_invalid_alias(isolated_data_dir: Path) -> None:
     with pytest.raises(DeviceRegistryError):
-        register_device("a/b", usb_port="3-1", vid=0x1A86, pid=0x7523)
+        register_device("a/b", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
 
 
 # ── generate_udev_rules ──────────────────────────────────────────────────
@@ -124,23 +126,23 @@ def test_rules_empty_registry_has_just_header() -> None:
 
 
 def test_rules_serial_based() -> None:
-    reg = _reg("agv2", serial="A1B2", vid=0x10C4, pid=0xEA60, chip="CP2102")
+    reg = _reg("agv2", serial="A1B2", vid=0x10C4, pid=0xEA60, usb_chip="CP2102")
     out = generate_udev_rules({"agv2": reg})
     assert 'ATTRS{serial}=="A1B2"' in out
     assert 'ATTRS{idVendor}=="10c4"' in out
     assert 'ATTRS{idProduct}=="ea60"' in out
-    assert 'SYMLINK+="esp32-agv2"' in out
+    assert 'SYMLINK+="tty-agv2"' in out
     assert 'ENV{TELETOP_ALIAS}="agv2"' in out
     # Serial-pinned rule must NOT include KERNELS — that would over-constrain.
     assert "KERNELS==" not in out
 
 
 def test_rules_port_based() -> None:
-    reg = _reg("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, chip="CH340")
+    reg = _reg("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, usb_chip="CH340")
     out = generate_udev_rules({"agv1": reg})
     assert 'KERNELS=="3-1"' in out
     assert "ATTRS{serial}" not in out
-    assert 'SYMLINK+="esp32-agv1"' in out
+    assert 'SYMLINK+="tty-agv1"' in out
 
 
 def test_rules_skip_when_vid_pid_missing() -> None:
@@ -148,7 +150,7 @@ def test_rules_skip_when_vid_pid_missing() -> None:
     out = generate_udev_rules({"ghost": reg})
     assert "skipped ghost" in out
     assert "missing VID/PID" in out
-    assert 'SYMLINK+="esp32-ghost"' not in out
+    assert 'SYMLINK+="tty-ghost"' not in out
 
 
 def test_rules_lowercase_hex() -> None:
@@ -164,6 +166,81 @@ def test_rules_mixed_registry_sorted_by_alias() -> None:
     b = _reg("aaa", usb_port="3-1", vid=0x1A86, pid=0x7523)
     out = generate_udev_rules({"zzz": a, "aaa": b})
     assert out.index("aaa") < out.index("zzz")
+
+
+def test_rules_include_telotop_target_env() -> None:
+    """Generated rule must surface target_chip via ENV{TELETOP_TARGET}."""
+    reg = _reg(
+        "agv1",
+        usb_port="3-1",
+        vid=0x1A86,
+        pid=0x7523,
+        usb_chip="CH340",
+        target_chip="esp8266",
+    )
+    out = generate_udev_rules({"agv1": reg})
+    assert 'ENV{TELETOP_TARGET}="esp8266"' in out
+    assert 'ENV{TELETOP_ALIAS}="agv1"' in out
+    # Header comment surfaces target so a human grepping the file gets context.
+    assert "target=esp8266" in out
+
+
+def test_rules_symlink_prefix_is_tty() -> None:
+    """0.2 moved /dev/esp32-X to /dev/tty-X for ESP-family-agnostic naming."""
+    reg = _reg("foo", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    out = generate_udev_rules({"foo": reg})
+    assert 'SYMLINK+="tty-foo"' in out
+    assert 'SYMLINK+="esp32-foo"' not in out
+
+
+# ── detect_target_chip parser ────────────────────────────────────────────
+
+
+def test_detect_parser_esp32_classic() -> None:
+    from teletop_server.devices import _parse_target_chip_from_esptool
+
+    out = "Detecting chip type...\nChip is ESP32-D0WD-V3 (revision v3.1)\n"
+    assert _parse_target_chip_from_esptool(out) == "esp32"
+
+
+def test_detect_parser_esp32s3() -> None:
+    from teletop_server.devices import _parse_target_chip_from_esptool
+
+    out = "Chip is ESP32-S3 (revision v0.1)\n"
+    assert _parse_target_chip_from_esptool(out) == "esp32s3"
+
+
+def test_detect_parser_esp8266() -> None:
+    from teletop_server.devices import _parse_target_chip_from_esptool
+
+    assert _parse_target_chip_from_esptool("Chip is ESP8266EX") == "esp8266"
+
+
+def test_detect_parser_specific_beats_generic() -> None:
+    """When both 'ESP32' and 'ESP32-S3' appear, the more specific wins."""
+    from teletop_server.devices import _parse_target_chip_from_esptool
+
+    out = "ESP32 family detected\nChip is ESP32-S3"
+    assert _parse_target_chip_from_esptool(out) == "esp32s3"
+
+
+def test_detect_parser_unknown_raises() -> None:
+    from teletop_server.devices import _parse_target_chip_from_esptool
+
+    with pytest.raises(RuntimeError, match="could not detect"):
+        _parse_target_chip_from_esptool("nothing useful here")
+
+
+def test_detect_target_chip_subprocess_mocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify detect_target_chip wraps subprocess and feeds its output to the parser."""
+    from teletop_server import devices as devmod
+
+    class _Result:
+        stdout = "Chip is ESP32-C3 (revision v0.4)\n"
+        stderr = ""
+
+    monkeypatch.setattr(devmod.subprocess, "run", lambda *a, **kw: _Result())
+    assert devmod.detect_target_chip("/dev/ttyUSB0") == "esp32c3"
 
 
 # ── install / uninstall ──────────────────────────────────────────────────
@@ -240,11 +317,11 @@ def test_uninstall_requires_root(fake_udev_paths) -> None:  # type: ignore[no-un
 def test_status_populates_udev_symlink_when_present(
     isolated_data_dir: Path, fake_udev_paths  # type: ignore[no-untyped-def]
 ) -> None:
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
     sym_dir = fake_udev_paths["symlink_dir"]
     # Create a dangling symlink — get_device_status should still surface it.
     target = sym_dir / "ttyUSBX"
-    link = sym_dir / "esp32-agv1"
+    link = sym_dir / "tty-agv1"
     link.symlink_to(target)
 
     statuses = get_device_status(ports=[])
@@ -255,7 +332,7 @@ def test_status_populates_udev_symlink_when_present(
 def test_status_leaves_udev_symlink_none_when_absent(
     isolated_data_dir: Path, fake_udev_paths  # type: ignore[no-untyped-def]
 ) -> None:
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
     statuses = get_device_status(ports=[])
     assert statuses[0].udev_symlink is None
 
@@ -264,20 +341,20 @@ def test_status_leaves_udev_symlink_none_when_absent(
 
 
 def test_cli_udev_rules_renders(isolated_data_dir: Path) -> None:
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
     from teletop_server.main import cli
 
     runner = CliRunner()
     result = runner.invoke(cli, ["udev-rules"])
     assert result.exit_code == 0, result.output
-    assert "esp32-agv1" in result.output
+    assert "tty-agv1" in result.output
     assert 'KERNELS=="3-1"' in result.output
 
 
 def test_cli_udev_install_without_root(
     isolated_data_dir: Path, fake_udev_paths  # type: ignore[no-untyped-def]
 ) -> None:
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
     from teletop_server.main import cli
 
     runner = CliRunner()
@@ -292,7 +369,7 @@ def test_cli_udev_install_as_root(
     root_euid,  # type: ignore[no-untyped-def]
     fake_udevadm,  # type: ignore[no-untyped-def]
 ) -> None:
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
     from teletop_server.main import cli
 
     runner = CliRunner()
@@ -300,7 +377,7 @@ def test_cli_udev_install_as_root(
     assert result.exit_code == 0, result.output
     rules = fake_udev_paths["rules"]
     assert rules.exists()
-    assert "esp32-agv1" in rules.read_text()
+    assert "tty-agv1" in rules.read_text()
     assert ["udevadm", "control", "--reload"] in fake_udevadm
 
 
@@ -409,7 +486,7 @@ def test_udev_install_under_sudo_finds_registry_in_user_home(
     talat_data = fake_home / "teletop"
     talat_data.mkdir(parents=True)
     monkeypatch.setenv("TELETOP_DATA_DIR", str(talat_data))
-    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523, target_chip="esp32")
 
     # 2. Drop the explicit override (sudo strips most of the user's env).
     monkeypatch.delenv("TELETOP_DATA_DIR")
@@ -431,7 +508,7 @@ def test_udev_install_under_sudo_finds_registry_in_user_home(
     assert result.exit_code == 0, result.output
 
     rules_text = fake_udev_paths["rules"].read_text()
-    assert "esp32-agv1" in rules_text
+    assert "tty-agv1" in rules_text
     assert 'KERNELS=="3-1"' in rules_text
 
 

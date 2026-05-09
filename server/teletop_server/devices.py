@@ -9,16 +9,19 @@ the user keeps the board in the same physical RPi USB socket.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Literal, get_args
 
 from pydantic import BaseModel, model_validator
 
 from .config import get_settings
+
+logger = logging.getLogger("teletop.devices")
 
 # Known USB-serial bridge / native-USB vendors found on ESP32 DevKits.
 ESP_VENDOR_IDS: frozenset[int] = frozenset(
@@ -30,6 +33,21 @@ ESP_VENDOR_IDS: frozenset[int] = frozenset(
     }
 )
 
+# Target ESP chip families. The USB-UART converter is a separate concern
+# (see `usb_chip` field) — the target dictates flash binaries and memory
+# layout, not how bytes get to the chip.
+TargetChip = Literal[
+    "esp32",
+    "esp8266",
+    "esp32s2",
+    "esp32s3",
+    "esp32c3",
+    "esp32c6",
+    "esp32h2",
+]
+TARGET_CHIPS: tuple[str, ...] = tuple(get_args(TargetChip))
+DEFAULT_TARGET_CHIP: TargetChip = "esp32"
+
 REGISTRY_FILENAME = "devices.json"
 
 # udev rule destination + symlink directory. Both can be overridden via env
@@ -38,9 +56,12 @@ UDEV_RULES_PATH = Path(
     os.environ.get("TELETOP_UDEV_RULES_PATH", "/etc/udev/rules.d/99-teletop.rules")
 )
 SYMLINK_DIR = Path(os.environ.get("TELETOP_SYMLINK_DIR", "/dev"))
-SYMLINK_PREFIX = "esp32-"
+# `tty-` is ESP-family-agnostic (ESP8266 boards also live here) and reads
+# naturally with shell tab-completion against /dev/tty*. Devices registered
+# before 0.2 used "esp32-" — udev re-trigger drops the old links.
+SYMLINK_PREFIX = "tty-"
 
-# Aliases double as udev SYMLINK names (`/dev/esp32-<alias>`); keep them safe.
+# Aliases double as udev SYMLINK names (`/dev/tty-<alias>`); keep them safe.
 ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -57,7 +78,7 @@ class DiscoveredPort(BaseModel):
     description: str = ""
     usb_port: str | None = None
     id_path: str | None = None
-    chip: str | None = None  # Inferred (CH340 / CP2102 / ESP32-USB / FTDI / None)
+    usb_chip: str | None = None  # CH340 / CP2102 / ESP32-USB / FTDI / None
 
 
 class DeviceRegistration(BaseModel):
@@ -66,7 +87,8 @@ class DeviceRegistration(BaseModel):
     usb_port: str | None = None
     vid: int | None = None
     pid: int | None = None
-    chip: str | None = None
+    usb_chip: str | None = None  # USB-UART converter (CH340, CP2102, …)
+    target_chip: TargetChip  # ESP family — required, drives flash layout
     udev_symlink: str | None = None  # filled by Task 3
     created_at: datetime
     notes: str | None = None
@@ -87,7 +109,8 @@ class DeviceStatus(BaseModel):
     connected: bool = False
     vid: int | None = None
     pid: int | None = None
-    chip: str | None = None
+    usb_chip: str | None = None
+    target_chip: TargetChip = DEFAULT_TARGET_CHIP
 
 
 class DiscoveredPortWithRegistration(BaseModel):
@@ -98,12 +121,13 @@ class DiscoveredPortWithRegistration(BaseModel):
 # ── Chip inference ───────────────────────────────────────────────────────
 
 
-def guess_chip(
+def guess_usb_chip(
     vid: int | None,
     pid: int | None,
     manufacturer: str | None = None,
     product: str | None = None,
 ) -> str | None:
+    """Best-effort USB-UART converter chip name from VID/PID and strings."""
     if vid == 0x1A86:
         if pid == 0x7523:
             return "CH340"
@@ -185,7 +209,7 @@ def _build_discovered_port(tty_dev) -> DiscoveredPort | None:  # type: ignore[no
         except Exception:  # pragma: no cover
             id_path = None
     description = " ".join(filter(None, [manufacturer, product])).strip() or node
-    chip = guess_chip(vid, pid, manufacturer, product)
+    usb_chip = guess_usb_chip(vid, pid, manufacturer, product)
     return DiscoveredPort(
         device=node,
         vid=vid,
@@ -196,7 +220,7 @@ def _build_discovered_port(tty_dev) -> DiscoveredPort | None:  # type: ignore[no
         description=description,
         usb_port=usb_port,
         id_path=id_path,
-        chip=chip,
+        usb_chip=usb_chip,
     )
 
 
@@ -257,11 +281,41 @@ def _registry_path() -> Path:
 
 
 def load_registry() -> dict[str, DeviceRegistration]:
+    """Load the registry, applying old-format migrations on the way.
+
+    Migrations performed:
+      • field rename ``chip`` → ``usb_chip``
+      • inject ``target_chip = DEFAULT_TARGET_CHIP`` for entries that lack
+        the field, with a warning log so the user knows to run set-target.
+
+    Migrated registries are persisted on the way out so we don't repeat the
+    rename next time. The defaulted target_chip is also persisted; the
+    warning fires only on the first load that needs the migration.
+    """
     path = _registry_path()
     if not path.exists():
         return {}
     raw = json.loads(path.read_text())
-    return {alias: DeviceRegistration.model_validate(data) for alias, data in raw.items()}
+    out: dict[str, DeviceRegistration] = {}
+    needs_persist = False
+    for alias, data in raw.items():
+        if "chip" in data and "usb_chip" not in data:
+            data["usb_chip"] = data.pop("chip")
+            needs_persist = True
+        if not data.get("target_chip"):
+            logger.warning(
+                "device %r has no target_chip in registry, defaulted to %s. "
+                "Run `teletop-server set-target %s <chip>` to correct.",
+                alias,
+                DEFAULT_TARGET_CHIP,
+                alias,
+            )
+            data["target_chip"] = DEFAULT_TARGET_CHIP
+            needs_persist = True
+        out[alias] = DeviceRegistration.model_validate(data)
+    if needs_persist:
+        save_registry(out)
+    return out
 
 
 def save_registry(registry: dict[str, DeviceRegistration]) -> None:
@@ -321,20 +375,19 @@ def _validate_unique(
 def register_device(
     alias: str,
     *,
+    target_chip: TargetChip,
     port: DiscoveredPort | None = None,
     serial_number: str | None = None,
     usb_port: str | None = None,
     vid: int | None = None,
     pid: int | None = None,
-    chip: str | None = None,
+    usb_chip: str | None = None,
     notes: str | None = None,
 ) -> DeviceRegistration:
-    """Persist a new alias. Pass either a discovered port or explicit fields.
+    """Persist a new alias. ``target_chip`` is mandatory.
 
-    When both a port and explicit fields are provided, explicit values win.
-    Identity precedence (when both serial and usb_port are present): the
-    serial is used as primary identifier; the usb_port is recorded as
-    metadata for diagnostics but matching will hit serial first.
+    Pass either a discovered port or explicit fields. When both are given,
+    explicit values win. Identity precedence: serial first, then usb_port.
     """
     registry = load_registry()
 
@@ -343,10 +396,12 @@ def register_device(
         usb_port = usb_port if usb_port is not None else port.usb_port
         vid = vid if vid is not None else port.vid
         pid = pid if pid is not None else port.pid
-        if chip is None:
-            chip = port.chip or guess_chip(vid, pid, port.manufacturer, port.product)
-    if chip is None:
-        chip = guess_chip(vid, pid)
+        if usb_chip is None:
+            usb_chip = port.usb_chip or guess_usb_chip(
+                vid, pid, port.manufacturer, port.product
+            )
+    if usb_chip is None:
+        usb_chip = guess_usb_chip(vid, pid)
 
     validate_alias(alias)
     _validate_unique(registry, alias=alias, serial_number=serial_number, usb_port=usb_port)
@@ -357,13 +412,38 @@ def register_device(
         usb_port=usb_port,
         vid=vid,
         pid=pid,
-        chip=chip,
+        usb_chip=usb_chip,
+        target_chip=target_chip,
         created_at=datetime.now(timezone.utc),
         notes=notes,
     )
     registry[alias] = reg
     save_registry(registry)
     return reg
+
+
+def update_device(
+    alias: str,
+    *,
+    target_chip: TargetChip | None = None,
+    notes: str | None = None,
+) -> DeviceRegistration:
+    """Mutate an existing registration. ``serial_number`` and ``usb_port``
+    are immutable here — re-register if those need to change."""
+    registry = load_registry()
+    if alias not in registry:
+        raise KeyError(alias)
+    updates: dict[str, object] = {}
+    if target_chip is not None:
+        updates["target_chip"] = target_chip
+    if notes is not None:
+        updates["notes"] = notes
+    if not updates:
+        return registry[alias]
+    new_reg = registry[alias].model_copy(update=updates)
+    registry[alias] = new_reg
+    save_registry(registry)
+    return new_reg
 
 
 def unregister_device(alias: str) -> None:
@@ -413,11 +493,65 @@ def get_device_status(
                 connected=port is not None,
                 vid=reg.vid,
                 pid=reg.pid,
-                chip=reg.chip,
+                usb_chip=reg.usb_chip,
+                target_chip=reg.target_chip,
             )
         )
     statuses.sort(key=lambda s: s.alias)
     return statuses
+
+
+# ── Target chip auto-detect (esptool) ────────────────────────────────────
+
+
+def _parse_target_chip_from_esptool(output: str) -> TargetChip:
+    """Map an esptool ``chip_id`` stdout/stderr blob to a TargetChip literal.
+
+    esptool prints the chip name in a few different shapes:
+      "Chip is ESP32-D0WD-V3 (revision v3.1)"
+      "Chip is ESP32-S3 (revision v0.1)"
+      "Chip is ESP8266EX"
+      "Detecting chip type... Unsupported detection protocol, ..."
+    """
+    text = output.lower()
+    # More specific names first — "esp32-s3" must beat the generic "esp32".
+    candidates: list[tuple[str, TargetChip]] = [
+        ("esp32-s3", "esp32s3"),
+        ("esp32s3", "esp32s3"),
+        ("esp32-s2", "esp32s2"),
+        ("esp32s2", "esp32s2"),
+        ("esp32-c6", "esp32c6"),
+        ("esp32c6", "esp32c6"),
+        ("esp32-c3", "esp32c3"),
+        ("esp32c3", "esp32c3"),
+        ("esp32-h2", "esp32h2"),
+        ("esp32h2", "esp32h2"),
+        ("esp8266", "esp8266"),
+        ("esp32", "esp32"),
+    ]
+    for needle, chip in candidates:
+        if needle in text:
+            return chip
+    raise RuntimeError(
+        "could not detect target chip from esptool output:\n" + output[:2000]
+    )
+
+
+def detect_target_chip(device_path: str, *, timeout: float = 12.0) -> TargetChip:
+    """Run ``esptool.py --port <device> chip_id`` and parse the result.
+
+    The chip is briefly bounced through bootloader; the device should not be
+    actively running important code while this runs.
+    """
+    result = subprocess.run(
+        ["esptool.py", "--port", device_path, "chip_id"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    blob = (result.stdout or "") + (result.stderr or "")
+    return _parse_target_chip_from_esptool(blob)
 
 
 # ── udev rule generation ─────────────────────────────────────────────────
@@ -466,9 +600,13 @@ def _format_rule(reg: DeviceRegistration) -> str:
         'GROUP="dialout"',
         'MODE="0660"',
         f'ENV{{TELETOP_ALIAS}}="{reg.alias}"',
+        f'ENV{{TELETOP_TARGET}}="{reg.target_chip}"',
     ]
-    chip_label = reg.chip or "unknown chip"
-    header = f"# {reg.alias} ({chip_label}, {identity_kind}-based identity)\n"
+    usb_label = reg.usb_chip or "unknown USB"
+    header = (
+        f"# {reg.alias} (target={reg.target_chip}, usb={usb_label}, "
+        f"{identity_kind}-based identity)\n"
+    )
     body = ", \\\n    ".join(parts)
     return header + body + "\n"
 
@@ -545,6 +683,7 @@ def discover_with_registrations(
 
 __all__ = [
     "ALIAS_PATTERN",
+    "DEFAULT_TARGET_CHIP",
     "DeviceRegistration",
     "DeviceRegistryError",
     "DeviceStatus",
@@ -553,12 +692,15 @@ __all__ = [
     "ESP_VENDOR_IDS",
     "SYMLINK_DIR",
     "SYMLINK_PREFIX",
+    "TARGET_CHIPS",
+    "TargetChip",
     "UDEV_RULES_PATH",
+    "detect_target_chip",
     "discover_ports",
     "discover_with_registrations",
     "generate_udev_rules",
     "get_device_status",
-    "guess_chip",
+    "guess_usb_chip",
     "install_udev_rules",
     "load_registry",
     "match_registration",
@@ -567,5 +709,6 @@ __all__ = [
     "symlink_for",
     "uninstall_udev_rules",
     "unregister_device",
+    "update_device",
     "validate_alias",
 ]
