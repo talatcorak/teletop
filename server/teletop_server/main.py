@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from rich.table import Table
 from . import __version__ as fallback_version
 from .config import get_settings
 from .devices import (
+    UDEV_RULES_PATH,
     DeviceRegistration,
     DeviceRegistryError,
     DeviceStatus,
@@ -27,10 +29,14 @@ from .devices import (
     DiscoveredPortWithRegistration,
     discover_ports,
     discover_with_registrations,
+    generate_udev_rules,
     get_device_status,
+    install_udev_rules,
     load_registry,
     match_registration,
     register_device,
+    symlink_for,
+    uninstall_udev_rules,
     unregister_device,
 )
 from .ws import WebSocketDisconnect, manager
@@ -240,10 +246,27 @@ def discover(show_all: bool) -> None:
     console.print(table)
 
 
+def _parse_hex_int(ctx: click.Context, param: click.Parameter, value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value, 0)  # accepts "0x1A86", "1A86", "6790"
+    except ValueError:
+        raise click.BadParameter(f"{value!r} is not a valid integer")
+
+
 @cli.command()
 @click.argument("alias")
 @click.option("--serial", "serial_number", default=None, help="Pin to USB serial number.")
 @click.option("--port", "usb_port", default=None, help="Pin to USB port path (e.g. 3-1).")
+@click.option(
+    "--vid", "vid", default=None, callback=_parse_hex_int,
+    help="USB vendor ID (hex, e.g. 0x1A86). Required for udev rule generation.",
+)
+@click.option(
+    "--pid", "pid", default=None, callback=_parse_hex_int,
+    help="USB product ID (hex, e.g. 0x7523). Required for udev rule generation.",
+)
 @click.option("--note", "notes", default=None, help="Free-form note.")
 @click.option(
     "--all",
@@ -255,6 +278,8 @@ def register(
     alias: str,
     serial_number: str | None,
     usb_port: str | None,
+    vid: int | None,
+    pid: int | None,
     notes: str | None,
     show_all: bool,
 ) -> None:
@@ -273,6 +298,8 @@ def register(
                 alias,
                 serial_number=serial_number,
                 usb_port=usb_port,
+                vid=vid,
+                pid=pid,
                 notes=notes,
             )
         except DeviceRegistryError as exc:
@@ -281,7 +308,14 @@ def register(
         console.print(
             f"[green]registered[/green] {alias} via "
             f"{'serial=' + reg.serial_number if reg.serial_number else 'usb_port=' + (reg.usb_port or '?')}"
+            f" (chip={reg.chip or 'unknown'})"
         )
+        if (reg.vid is None or reg.pid is None):
+            console.print(
+                "[yellow]warning:[/yellow] no VID/PID — udev rule generation "
+                "will skip this entry. Pass --vid/--pid or re-register interactively."
+            )
+        _maybe_offer_udev_reinstall(console)
         return
 
     ports = discover_ports(esp_only=not show_all)
@@ -317,6 +351,7 @@ def register(
         sys.exit(1)
 
     console.print(f"[green]registered[/green] {alias} ({reg.chip or 'unknown chip'})")
+    _maybe_offer_udev_reinstall(console)
 
 
 @cli.command()
@@ -334,6 +369,7 @@ def unregister(alias: str, yes: bool) -> None:
         console.print(f"[red]error:[/red] alias {alias!r} not registered")
         sys.exit(1)
     console.print(f"[green]unregistered[/green] {alias}")
+    _maybe_offer_udev_reinstall(console)
 
 
 @cli.command(name="list")
@@ -366,6 +402,87 @@ def list_cmd() -> None:
         )
 
     console.print(table)
+
+
+# ── udev commands ────────────────────────────────────────────────────────
+
+
+def _maybe_offer_udev_reinstall(console: Console) -> None:
+    """If teletop udev rules are already installed, offer to refresh them."""
+    if not UDEV_RULES_PATH.exists():
+        return
+    if not click.confirm("Re-install udev rules now?", default=True):
+        console.print(
+            "[dim]hint:[/dim] run "
+            "[bold]sudo $(which uv) run teletop-server udev-install[/bold] later"
+        )
+        return
+    try:
+        install_udev_rules()
+    except PermissionError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+    except Exception as exc:  # pragma: no cover — best-effort surface
+        console.print(f"[red]udev reload failed:[/red] {exc}")
+    else:
+        console.print(f"[green]reloaded[/green] {UDEV_RULES_PATH}")
+
+
+@cli.command(name="udev-rules")
+def udev_rules_cmd() -> None:
+    """Print the udev rules file derived from the current registry."""
+    click.echo(generate_udev_rules(), nl=False)
+
+
+@cli.command(name="udev-install")
+def udev_install_cmd() -> None:
+    """Write the rules file to /etc/udev/rules.d and reload udev (root only)."""
+    console = Console()
+    try:
+        path = install_udev_rules()
+    except PermissionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]udevadm failed:[/red] {exc}")
+        sys.exit(1)
+
+    statuses = get_device_status()
+    console.print(f"[green]installed[/green] {path}")
+    if not statuses:
+        console.print("[dim]no devices registered yet — nothing to symlink[/dim]")
+        return
+    table = Table(title="Symlinks after reload")
+    table.add_column("alias")
+    table.add_column("symlink")
+    table.add_column("identity")
+    for s in statuses:
+        sym = symlink_for(s.alias)
+        table.add_row(s.alias, str(sym), f"{s.identity_type}={s.identity_value}")
+    console.print(table)
+
+
+@cli.command(name="udev-uninstall")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def udev_uninstall_cmd(yes: bool) -> None:
+    """Remove the rules file and reload udev (root only)."""
+    console = Console()
+    if not yes and not click.confirm(
+        f"Remove {UDEV_RULES_PATH}?", default=False
+    ):
+        console.print("[yellow]aborted[/yellow]")
+        return
+    try:
+        removed = uninstall_udev_rules()
+    except PermissionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]udevadm failed:[/red] {exc}")
+        sys.exit(1)
+    if removed:
+        console.print(f"[green]removed[/green] {UDEV_RULES_PATH}")
+    else:
+        console.print(f"[dim]no rules file at[/dim] {UDEV_RULES_PATH}")
 
 
 if __name__ == "__main__":

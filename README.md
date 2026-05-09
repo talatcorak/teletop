@@ -45,3 +45,36 @@ Server `TELETOP_*` env vars ile yapılandırılır:
 - `TELETOP_PORT` (default `8000`)
 - `TELETOP_DATA_DIR` (default `~/teletop`)
 - `TELETOP_AUTH_TOKEN` (Task 12'den itibaren zorunlu)
+
+## Raspberry Pi initial setup
+
+İlk kurulum için RPi'da sırayla:
+
+```bash
+# 1. Repo'yu klonla (örnek hedef: ~/teletop-src)
+git clone <repo-url> ~/teletop-src
+cd ~/teletop-src
+
+# 2. uv kur (kullanıcı olarak, root değil)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 3. APT bağımlılıkları + dialout grup üyeliği + uv sync (idempotent)
+sudo bash server/scripts/setup-rpi.sh
+
+# 4. dialout yeni eklendiyse bir kez logout/login (oturum yenile)
+
+# 5. Cihazları kaydet
+cd server
+uv run teletop-server discover                 # önce kuru tarama
+uv run teletop-server register agv1            # interaktif (önerilen)
+# veya: uv run teletop-server register agv1 --port 3-1 --vid 0x1A86 --pid 0x7523
+
+# 6. udev rule'larını yükle (cihazları stable /dev/esp32-<alias> olarak görünür yapar)
+sudo $(which uv) run teletop-server udev-install
+
+# 7. Doğrula
+ls -l /dev/esp32-*
+uv run teletop-server list
+```
+
+`setup-rpi.sh` idempotent — yeniden çalıştırmak güvenli. Devices kaydetmeden çalıştırırsan udev install'ı atlar; sonradan `udev-install` ile manuel ekleyebilirsin. Yeni cihaz eklediğinde / sildiğinde CLI sana udev rule'larını yenilemeyi soracak.
