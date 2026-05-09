@@ -53,36 +53,19 @@ class ConnectionManager:
 
         payload: str = json.dumps(message) if isinstance(message, dict) else message
 
-        # ──────────────────────────────────────────────────────────────────
-        # TODO(user): implement the send loop.
-        #
-        # Required behavior:
-        #   1. Send `payload` (str) to every WebSocket in `targets`.
-        #   2. Collect any socket whose send raises (WebSocketDisconnect,
-        #      RuntimeError from a closed socket, generic Exception — be
-        #      permissive; the websocket lib raises a few different types).
-        #   3. After the loop, call `await self.disconnect(ws, channel)` for
-        #      each dead socket so we don't keep retrying them next tick.
-        #
-        # Design choice you're making (this is the interesting part):
-        #
-        #   (A) Sequential `await ws.send_text(payload)` — simple, but a slow
-        #       client blocks every later client in the channel. Fine for a
-        #       handful of monitors on a LAN; bad if any client is on flaky
-        #       wifi while serial output is bursting at 921600 baud.
-        #
-        #   (B) `await asyncio.gather(*sends, return_exceptions=True)` —
-        #       concurrent, no head-of-line blocking. You then walk the
-        #       results and pair `targets[i]` with exceptions. Slightly more
-        #       code, much better isolation between subscribers.
-        #
-        # For teletop we expect 1–3 viewers per device on a trusted LAN, but
-        # the same manager will also push flash progress (chunky binary-ish
-        # ticks) so isolation matters more than absolute simplicity.
-        #
-        # Pick one and write it. ~5–10 lines.
-        # ──────────────────────────────────────────────────────────────────
-        raise NotImplementedError("ConnectionManager.broadcast: implement send loop")
+        # Strategy (B): concurrent send via asyncio.gather. A slow or stuck
+        # client must not delay deliveries to its siblings — flash progress
+        # and high-baud serial output share this manager.
+        results = await asyncio.gather(
+            *(ws.send_text(payload) for ws in targets),
+            return_exceptions=True,
+        )
+        dead = [ws for ws, res in zip(targets, results) if isinstance(res, BaseException)]
+        for ws, res in zip(targets, results):
+            if isinstance(res, BaseException):
+                logger.debug("ws send failed channel=%s err=%r", channel, res)
+        for ws in dead:
+            await self.disconnect(ws, channel)
 
     async def send_json(self, channel: str, payload: dict[str, Any]) -> None:
         """Structured-event helper. Same as broadcast(channel, dict)."""

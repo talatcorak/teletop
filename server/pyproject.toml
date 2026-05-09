@@ -32,6 +32,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["teletop_server"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A system-wide ROS install (/opt/ros/humble) leaks onto sys.path via
+# PYTHONPATH and registers pytest11 entry points; explicitly disable each so
+# the venv stays isolated.
+addopts = "-p no:ament_pep257 -p no:ament_xmllint -p no:ament_lint -p no:ament_copyright -p no:ament_flake8 -p no:launch_testing -p no:launch_ros"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
