@@ -46,6 +46,14 @@ from .devices import (
     unregister_device,
     update_device,
 )
+from .monitor import (
+    LogPathError,
+    MonitorConfig,
+    channel_for,
+    list_log_files,
+    registry as monitor_registry,
+    resolve_log_file,
+)
 from .ws import WebSocketDisconnect, manager
 
 logging.basicConfig(
@@ -76,7 +84,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.web_dist_dir,
     )
     yield
-    logger.info("teletop shutting down")
+    logger.info("teletop shutting down — stopping serial monitors")
+    await monitor_registry.stop_all()
 
 
 # ── API request body models ──────────────────────────────────────────────
@@ -98,6 +107,58 @@ class DeviceUpdate(BaseModel):
 
     target_chip: TargetChip | None = None
     notes: str | None = None
+
+
+class MonitorStartBody(BaseModel):
+    baudrate: int | None = None
+
+
+# ── Monitor helpers (used by REST + CLI) ─────────────────────────────────
+
+
+def _resolve_alias_for_monitor(alias: str) -> tuple[str, str]:
+    """Look up alias and return (current_device_path, target_chip_label).
+
+    Raises HTTPException(404) if alias is unknown,
+    HTTPException(409) if the device isn't currently connected.
+    """
+    statuses = {s.alias: s for s in get_device_status()}
+    status = statuses.get(alias)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"alias {alias!r} not registered")
+    # Prefer the stable udev symlink when available — survives device-node
+    # renumbering (ttyUSB0 ↔ ttyUSB1) across replug. Falls back to the
+    # current /dev/tty* path the kernel assigned.
+    device_path = status.udev_symlink or status.current_device
+    if not device_path:
+        raise HTTPException(
+            status_code=409,
+            detail=f"device {alias!r} is not connected — plug it in or check udev",
+        )
+    return device_path, status.target_chip
+
+
+def _monitor_summary(alias: str) -> dict[str, object]:
+    mon = monitor_registry.get(alias)
+    if mon is None:
+        return {
+            "alias": alias,
+            "running": False,
+            "since": None,
+            "log_file": None,
+            "baudrate": None,
+            "device_path": None,
+        }
+    return {
+        "alias": alias,
+        "running": mon.is_running(),
+        "since": mon.started_at.isoformat().replace("+00:00", "Z")
+        if mon.started_at
+        else None,
+        "log_file": str(mon.log_path) if mon.log_path else None,
+        "baudrate": mon.cfg.baudrate,
+        "device_path": mon.cfg.device_path,
+    }
 
 
 # ── App factory ──────────────────────────────────────────────────────────
@@ -178,6 +239,106 @@ def create_app() -> FastAPI:
                 await manager.broadcast(channel, f"echo[{channel}]: {msg}")
         except WebSocketDisconnect:
             await manager.disconnect(websocket, channel)
+
+    # ── Monitor endpoints ────────────────────────────────────────────────
+
+    @app.websocket("/ws/monitor/{alias}")
+    async def ws_monitor(websocket: WebSocket, alias: str) -> None:
+        channel = channel_for(alias)
+        await manager.connect(websocket, channel)
+        try:
+            mon = monitor_registry.get(alias)
+            state = "running" if mon and mon.is_running() else "stopped"
+            await websocket.send_json(
+                {"type": "status", "alias": alias, "state": state}
+            )
+            # Read-only stream — clients don't send anything back, but we
+            # need the receive loop so a disconnect surfaces as
+            # WebSocketDisconnect instead of stalling forever.
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await manager.disconnect(websocket, channel)
+
+    @app.post("/api/monitor/{alias}/start")
+    async def api_monitor_start(
+        alias: str, body: MonitorStartBody | None = None
+    ) -> dict[str, object]:
+        device_path, _ = _resolve_alias_for_monitor(alias)
+        settings = app.state.settings
+        baudrate = (body.baudrate if body else None) or settings.default_baudrate
+        cfg = MonitorConfig(
+            alias=alias,
+            device_path=device_path,
+            baudrate=baudrate,
+            log_dir=settings.log_dir,
+            queue_size=settings.monitor_queue_size,
+        )
+        try:
+            mon, already = await monitor_registry.start(cfg)
+        except (OSError, Exception) as exc:
+            # OSError covers ENOENT (no such file) / EBUSY (already open by
+            # something else like screen/picocom) / EACCES.
+            raise HTTPException(
+                status_code=500, detail=f"failed to open serial port: {exc}"
+            )
+        return {
+            "alias": alias,
+            "device_path": mon.cfg.device_path,
+            "baudrate": mon.cfg.baudrate,
+            "log_file": str(mon.log_path) if mon.log_path else None,
+            "already_running": already,
+        }
+
+    @app.post("/api/monitor/{alias}/stop")
+    async def api_monitor_stop(alias: str) -> dict[str, object]:
+        stopped = await monitor_registry.stop(alias)
+        return {"alias": alias, "stopped": stopped}
+
+    @app.get("/api/monitor")
+    async def api_monitor_list() -> list[dict[str, object]]:
+        # Combine known registered aliases with any active monitors so the
+        # caller sees both "running for an unknown alias" (shouldn't happen
+        # but catches drift) and "registered but never started".
+        known_aliases = {s.alias for s in get_device_status()}
+        active_aliases = set(monitor_registry.all().keys())
+        return [_monitor_summary(a) for a in sorted(known_aliases | active_aliases)]
+
+    @app.get("/api/monitor/{alias}/logs")
+    async def api_monitor_logs(alias: str) -> list[dict[str, object]]:
+        statuses = {s.alias for s in get_device_status()}
+        if alias not in statuses and monitor_registry.get(alias) is None:
+            raise HTTPException(
+                status_code=404, detail=f"alias {alias!r} not registered"
+            )
+        settings = app.state.settings
+        return list_log_files(settings.log_dir, alias)
+
+    @app.get("/api/monitor/{alias}/logs/{filename}")
+    async def api_monitor_log_download(alias: str, filename: str) -> Response:
+        statuses = {s.alias for s in get_device_status()}
+        if alias not in statuses and monitor_registry.get(alias) is None:
+            raise HTTPException(
+                status_code=404, detail=f"alias {alias!r} not registered"
+            )
+        settings = app.state.settings
+        try:
+            path = resolve_log_file(settings.log_dir, alias, filename)
+        except LogPathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=404, detail=f"log file {filename!r} not found"
+            )
+        return Response(
+            content=path.read_bytes(),
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{path.name}"'
+            },
+        )
 
     # Static SPA mount must come AFTER all API/WS routes — it's a catch-all.
     settings = get_settings()
@@ -678,6 +839,188 @@ def udev_uninstall_cmd(yes: bool) -> None:
             console.print(f"[dim]no rules file at[/dim] {UDEV_RULES_PATH}")
     finally:
         restore()
+
+
+# ── monitor commands ─────────────────────────────────────────────────────
+
+
+def _server_base_url() -> str:
+    settings = get_settings()
+    # Localhost is correct for the CLI's "talk to my own server" use case;
+    # 0.0.0.0 binds an interface but isn't routable as a destination.
+    host = "127.0.0.1" if settings.host in ("0.0.0.0", "::") else settings.host
+    return f"http://{host}:{settings.port}"
+
+
+def _ws_base_url() -> str:
+    return _server_base_url().replace("http://", "ws://", 1).replace(
+        "https://", "wss://", 1
+    )
+
+
+def _http_request(
+    method: str, path: str, *, json_body: dict[str, object] | None = None
+) -> tuple[int, object]:
+    """Issue an HTTP request to the local server, returning (status, body)."""
+    import httpx
+
+    url = _server_base_url() + path
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.request(method, url, json=json_body)
+    except httpx.ConnectError as exc:
+        raise click.ClickException(
+            f"could not reach server at {url} — is `teletop-server serve` running?\n"
+            f"  ({exc})"
+        )
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, r.text
+
+
+@cli.group()
+def monitor() -> None:
+    """Serial monitor commands — talk to the running teletop server."""
+
+
+@monitor.command("start")
+@click.argument("alias")
+@click.option(
+    "--baudrate", type=int, default=None, help="Override the default baudrate."
+)
+def monitor_start_cmd(alias: str, baudrate: int | None) -> None:
+    """Ask the server to start a monitor for ALIAS."""
+    console = Console()
+    body: dict[str, object] = {}
+    if baudrate is not None:
+        body["baudrate"] = baudrate
+    status, payload = _http_request(
+        "POST", f"/api/monitor/{alias}/start", json_body=body
+    )
+    if status == 404:
+        console.print(f"[red]error:[/red] alias {alias!r} not registered")
+        sys.exit(1)
+    if status == 409:
+        console.print(
+            f"[yellow]device {alias!r} not connected[/yellow] — plug it in first"
+        )
+        sys.exit(1)
+    if status >= 400:
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    assert isinstance(payload, dict)
+    already = payload.get("already_running")
+    verb = "already running" if already else "started"
+    console.print(
+        f"[green]{verb}[/green] {alias} on {payload.get('device_path')} "
+        f"@ {payload.get('baudrate')} baud"
+    )
+    if payload.get("log_file"):
+        console.print(f"  log → {payload['log_file']}")
+
+
+@monitor.command("stop")
+@click.argument("alias")
+def monitor_stop_cmd(alias: str) -> None:
+    """Ask the server to stop ALIAS's monitor."""
+    console = Console()
+    status, payload = _http_request("POST", f"/api/monitor/{alias}/stop")
+    if status >= 400:
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    assert isinstance(payload, dict)
+    if payload.get("stopped"):
+        console.print(f"[green]stopped[/green] {alias}")
+    else:
+        console.print(f"[dim]{alias} was not running[/dim]")
+
+
+@monitor.command("list")
+def monitor_list_cmd() -> None:
+    """Show every registered alias and whether a monitor is active."""
+    console = Console()
+    status, payload = _http_request("GET", "/api/monitor")
+    if status >= 400 or not isinstance(payload, list):
+        console.print(f"[red]error[/red] ({status}): {payload}")
+        sys.exit(1)
+    if not payload:
+        console.print("[dim]no devices registered yet[/dim]")
+        return
+    table = Table(title="Monitor status")
+    table.add_column("alias")
+    table.add_column("running")
+    table.add_column("device")
+    table.add_column("baud")
+    table.add_column("since (UTC)")
+    table.add_column("log file", overflow="fold")
+    for row in payload:
+        running = "[green]✓[/green]" if row.get("running") else "[dim]—[/dim]"
+        table.add_row(
+            str(row.get("alias", "?")),
+            running,
+            str(row.get("device_path") or "—"),
+            str(row.get("baudrate") or "—"),
+            str(row.get("since") or "—"),
+            str(row.get("log_file") or "—"),
+        )
+    console.print(table)
+
+
+async def _tail(alias: str) -> None:
+    """ws-client coroutine — print incoming line/status events to stdout."""
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+
+    console = Console()
+    url = f"{_ws_base_url()}/ws/monitor/{alias}"
+    try:
+        async with websockets.connect(url) as ws:
+            console.print(f"[dim]connected to {url} (Ctrl+C to exit)[/dim]")
+            async for raw in ws:
+                try:
+                    import json
+
+                    evt = json.loads(raw)
+                except ValueError:
+                    console.print(f"[dim]{raw}[/dim]")
+                    continue
+                etype = evt.get("type")
+                if etype == "line":
+                    ts = evt.get("ts", "")
+                    console.print(f"[dim]{ts}[/dim] {evt.get('text', '')}")
+                elif etype == "status":
+                    state = evt.get("state", "?")
+                    extra = evt.get("reason") or evt.get("error") or ""
+                    color = {
+                        "connected": "green",
+                        "running": "green",
+                        "stopped": "yellow",
+                        "disconnected": "yellow",
+                        "error": "red",
+                    }.get(state, "cyan")
+                    suffix = f" — {extra}" if extra else ""
+                    console.print(f"[{color}]●[/{color}] {state}{suffix}")
+                else:
+                    console.print(f"[dim]{evt}[/dim]")
+    except ConnectionClosed:
+        console.print("[dim]connection closed[/dim]")
+    except OSError as exc:
+        raise click.ClickException(
+            f"could not reach {url} — is `teletop-server serve` running?\n  ({exc})"
+        )
+
+
+@monitor.command("tail")
+@click.argument("alias")
+def monitor_tail_cmd(alias: str) -> None:
+    """Stream live monitor events for ALIAS to stdout (localhost test client)."""
+    import asyncio
+
+    try:
+        asyncio.run(_tail(alias))
+    except KeyboardInterrupt:
+        Console().print("[dim]\n^C — exiting[/dim]")
 
 
 if __name__ == "__main__":

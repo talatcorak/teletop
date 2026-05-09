@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pyserial>=3.5",
+    "pyserial-asyncio>=0.6",
     "esptool>=4.8",
     "websockets>=13",
     "pydantic>=2.9",
@@ -15,6 +16,7 @@ dependencies = [
     "pyudev>=0.24",
     "click>=8.1",
     "rich>=13.9",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -23,9 +25,9 @@ teletop-server = "teletop_server.main:cli"
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "pytest-asyncio>=0.24",
     "ruff>=0.7",
     "mypy>=1.13",
-    "httpx>=0.27",
 ]
 
 [build-system]
@@ -41,6 +43,7 @@ testpaths = ["tests"]
 # PYTHONPATH and registers pytest11 entry points; explicitly disable each so
 # the venv stays isolated.
 addopts = "-p no:ament_pep257 -p no:ament_xmllint -p no:ament_lint -p no:ament_copyright -p no:ament_flake8 -p no:launch_testing -p no:launch_ros"
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

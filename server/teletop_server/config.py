@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # Becomes mandatory in Task 12 (auth layer).
     auth_token: str | None = None
 
+    log_dir: Path = Path.home() / "teletop" / "logs"
+    default_baudrate: int = 115200
+    monitor_queue_size: int = 1000
+
 
 def get_settings() -> Settings:
     return Settings()
