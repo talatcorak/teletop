@@ -322,6 +322,144 @@ def test_cli_udev_uninstall_yes(
     assert not rules.exists()
 
 
+# ── resolve_data_dir (sudo HOME=/root regression) ────────────────────────
+
+
+def test_resolve_data_dir_uses_sudo_user_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When run via sudo without TELETOP_DATA_DIR, look in SUDO_USER's home."""
+    fake_home = tmp_path / "talat"
+    fake_home.mkdir()
+    monkeypatch.delenv("TELETOP_DATA_DIR", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "talat")
+
+    import pwd
+
+    class _FakePw:
+        pw_dir = str(fake_home)
+
+    monkeypatch.setattr(
+        pwd, "getpwnam", lambda name: _FakePw() if name == "talat" else (_ for _ in ()).throw(KeyError(name))
+    )
+    from teletop_server.config import Settings
+    from teletop_server.main import resolve_data_dir
+
+    assert resolve_data_dir(Settings()) == fake_home / "teletop"
+
+
+def test_resolve_data_dir_respects_explicit_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit TELETOP_DATA_DIR override beats the sudo fallback."""
+    monkeypatch.setenv("TELETOP_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "talat")
+    from teletop_server.config import Settings
+    from teletop_server.main import resolve_data_dir
+
+    # Settings reads the env var; resolve_data_dir must keep it.
+    assert resolve_data_dir(Settings()) == tmp_path
+
+
+def test_resolve_data_dir_normal_user_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SUDO_USER set without EUID=0 is a stale env crumb — ignore it."""
+    monkeypatch.delenv("TELETOP_DATA_DIR", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setenv("SUDO_USER", "talat")
+    from teletop_server.config import Settings
+    from teletop_server.main import resolve_data_dir
+
+    settings = Settings()
+    assert resolve_data_dir(settings) == settings.data_dir
+
+
+def test_resolve_data_dir_handles_unknown_sudo_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If pwd.getpwnam can't find SUDO_USER, fall back gracefully."""
+    monkeypatch.delenv("TELETOP_DATA_DIR", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "ghost")
+
+    import pwd
+
+    monkeypatch.setattr(
+        pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name))
+    )
+    from teletop_server.config import Settings
+    from teletop_server.main import resolve_data_dir
+
+    settings = Settings()
+    assert resolve_data_dir(settings) == settings.data_dir
+
+
+def test_udev_install_under_sudo_finds_registry_in_user_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_udev_paths,  # type: ignore[no-untyped-def]
+    fake_udevadm,  # type: ignore[no-untyped-def]
+) -> None:
+    """End-to-end: udev-install reads registry from SUDO_USER's home, not /root."""
+    # 1. Pre-populate the registry where the human user keeps it.
+    fake_home = tmp_path / "talat"
+    talat_data = fake_home / "teletop"
+    talat_data.mkdir(parents=True)
+    monkeypatch.setenv("TELETOP_DATA_DIR", str(talat_data))
+    register_device("agv1", usb_port="3-1", vid=0x1A86, pid=0x7523)
+
+    # 2. Drop the explicit override (sudo strips most of the user's env).
+    monkeypatch.delenv("TELETOP_DATA_DIR")
+
+    # 3. Pretend we're running as root with SUDO_USER pointing at talat.
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "talat")
+    import pwd
+
+    class _FakePw:
+        pw_dir = str(fake_home)
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda _: _FakePw())
+
+    from teletop_server.main import cli
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["udev-install"])
+    assert result.exit_code == 0, result.output
+
+    rules_text = fake_udev_paths["rules"].read_text()
+    assert "esp32-agv1" in rules_text
+    assert 'KERNELS=="3-1"' in rules_text
+
+
+def test_apply_data_dir_resolution_restores_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The teardown returned by _apply_data_dir_resolution must un-set the override."""
+    fake_home = tmp_path / "talat"
+    fake_home.mkdir()
+    monkeypatch.delenv("TELETOP_DATA_DIR", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "talat")
+    import pwd
+
+    class _FakePw:
+        pw_dir = str(fake_home)
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda _: _FakePw())
+
+    from teletop_server.main import _apply_data_dir_resolution
+
+    assert "TELETOP_DATA_DIR" not in os.environ
+    restore = _apply_data_dir_resolution()
+    assert os.environ["TELETOP_DATA_DIR"] == str(fake_home / "teletop")
+    restore()
+    assert "TELETOP_DATA_DIR" not in os.environ
+
+
 def test_cli_udev_uninstall_aborts_without_yes(
     isolated_data_dir: Path,
     fake_udev_paths,  # type: ignore[no-untyped-def]

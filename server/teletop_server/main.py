@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
-from typing import AsyncIterator
+from pathlib import Path
+from typing import AsyncIterator, Callable
 
 import click
 from fastapi import FastAPI, HTTPException, Response, WebSocket
@@ -19,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__ as fallback_version
-from .config import get_settings
+from .config import Settings, get_settings
 from .devices import (
     UDEV_RULES_PATH,
     DeviceRegistration,
@@ -407,6 +409,57 @@ def list_cmd() -> None:
 # ── udev commands ────────────────────────────────────────────────────────
 
 
+def resolve_data_dir(settings: Settings) -> Path:
+    """Pick the right data_dir under sudo.
+
+    Settings.data_dir defaults to ``Path.home() / "teletop"`` evaluated at
+    class-definition time, so a process started by sudo (HOME=/root) looks
+    in /root/teletop and misses the registry that lives in the invoking
+    user's home. When TELETOP_DATA_DIR is unset and we're root with a
+    populated SUDO_USER, fall back to that user's home.
+    """
+    if os.environ.get("TELETOP_DATA_DIR"):
+        return settings.data_dir
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        try:
+            import pwd
+
+            pw = pwd.getpwnam(sudo_user)
+            return Path(pw.pw_dir) / "teletop"
+        except (KeyError, ImportError):
+            pass
+    return settings.data_dir
+
+
+def _apply_data_dir_resolution() -> Callable[[], None]:
+    """Apply the SUDO_USER fallback if needed; return a teardown callable.
+
+    The handler should call the returned teardown in a finally block so
+    pytest's CliRunner (same process) doesn't leak a TELETOP_DATA_DIR
+    override across tests.
+    """
+    settings = get_settings()
+    resolved = resolve_data_dir(settings)
+    if resolved == settings.data_dir:
+        return lambda: None
+    prev = os.environ.get("TELETOP_DATA_DIR")
+    os.environ["TELETOP_DATA_DIR"] = str(resolved)
+    logger.info(
+        "reading registry from %s (resolved via SUDO_USER=%s)",
+        resolved / "devices.json",
+        os.environ.get("SUDO_USER"),
+    )
+
+    def _restore() -> None:
+        if prev is None:
+            os.environ.pop("TELETOP_DATA_DIR", None)
+        else:
+            os.environ["TELETOP_DATA_DIR"] = prev
+
+    return _restore
+
+
 def _maybe_offer_udev_reinstall(console: Console) -> None:
     """If teletop udev rules are already installed, offer to refresh them."""
     if not UDEV_RULES_PATH.exists():
@@ -437,28 +490,32 @@ def udev_rules_cmd() -> None:
 def udev_install_cmd() -> None:
     """Write the rules file to /etc/udev/rules.d and reload udev (root only)."""
     console = Console()
+    restore = _apply_data_dir_resolution()
     try:
-        path = install_udev_rules()
-    except PermissionError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        sys.exit(1)
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]udevadm failed:[/red] {exc}")
-        sys.exit(1)
+        try:
+            path = install_udev_rules()
+        except PermissionError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            sys.exit(1)
+        except subprocess.CalledProcessError as exc:
+            console.print(f"[red]udevadm failed:[/red] {exc}")
+            sys.exit(1)
 
-    statuses = get_device_status()
-    console.print(f"[green]installed[/green] {path}")
-    if not statuses:
-        console.print("[dim]no devices registered yet — nothing to symlink[/dim]")
-        return
-    table = Table(title="Symlinks after reload")
-    table.add_column("alias")
-    table.add_column("symlink")
-    table.add_column("identity")
-    for s in statuses:
-        sym = symlink_for(s.alias)
-        table.add_row(s.alias, str(sym), f"{s.identity_type}={s.identity_value}")
-    console.print(table)
+        statuses = get_device_status()
+        console.print(f"[green]installed[/green] {path}")
+        if not statuses:
+            console.print("[dim]no devices registered yet — nothing to symlink[/dim]")
+            return
+        table = Table(title="Symlinks after reload")
+        table.add_column("alias")
+        table.add_column("symlink")
+        table.add_column("identity")
+        for s in statuses:
+            sym = symlink_for(s.alias)
+            table.add_row(s.alias, str(sym), f"{s.identity_type}={s.identity_value}")
+        console.print(table)
+    finally:
+        restore()
 
 
 @cli.command(name="udev-uninstall")
@@ -466,23 +523,27 @@ def udev_install_cmd() -> None:
 def udev_uninstall_cmd(yes: bool) -> None:
     """Remove the rules file and reload udev (root only)."""
     console = Console()
-    if not yes and not click.confirm(
-        f"Remove {UDEV_RULES_PATH}?", default=False
-    ):
-        console.print("[yellow]aborted[/yellow]")
-        return
+    restore = _apply_data_dir_resolution()
     try:
-        removed = uninstall_udev_rules()
-    except PermissionError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        sys.exit(1)
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]udevadm failed:[/red] {exc}")
-        sys.exit(1)
-    if removed:
-        console.print(f"[green]removed[/green] {UDEV_RULES_PATH}")
-    else:
-        console.print(f"[dim]no rules file at[/dim] {UDEV_RULES_PATH}")
+        if not yes and not click.confirm(
+            f"Remove {UDEV_RULES_PATH}?", default=False
+        ):
+            console.print("[yellow]aborted[/yellow]")
+            return
+        try:
+            removed = uninstall_udev_rules()
+        except PermissionError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            sys.exit(1)
+        except subprocess.CalledProcessError as exc:
+            console.print(f"[red]udevadm failed:[/red] {exc}")
+            sys.exit(1)
+        if removed:
+            console.print(f"[green]removed[/green] {UDEV_RULES_PATH}")
+        else:
+            console.print(f"[dim]no rules file at[/dim] {UDEV_RULES_PATH}")
+    finally:
+        restore()
 
 
 if __name__ == "__main__":
