@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     data_dir: Path = Path.home() / "teletop"
+    web_dist_dir: Path = Path("/home/talat/teletop/web/dist")
     # Becomes mandatory in Task 12 (auth layer).
     auth_token: str | None = None
 
