@@ -12,6 +12,9 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "python-multipart>=0.0.12",
+    "pyudev>=0.24",
+    "click>=8.1",
+    "rich>=13.9",
 ]
 
 [project.scripts]

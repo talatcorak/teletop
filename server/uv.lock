@@ -826,6 +826,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyudev"
+version = "0.24.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/1d/8bdbf651de1002e8b58fbe817bee22b1e8bfcdd24341d42c3238ce9a75f4/pyudev-0.24.4.tar.gz", hash = "sha256:e788bb983700b1a84efc2e88862b0a51af2a995d5b86bc9997546505cf7b36bc", size = 56135, upload-time = "2025-10-08T17:26:58.661Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/51/3dc0cd6498b24dea3cdeaed648568e3ca7454d41334d840b114156d7479f/pyudev-0.24.4-py3-none-any.whl", hash = "sha256:b3b6b01c68e6fc628428cc45ff3fe6c277afbb5d96507f14473ddb4a6b959e00", size = 62784, upload-time = "2025-10-08T17:26:57.664Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -959,12 +968,15 @@ name = "teletop-server"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "esptool" },
     { name = "fastapi" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyserial" },
     { name = "python-multipart" },
+    { name = "pyudev" },
+    { name = "rich" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
@@ -979,12 +991,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.1" },
     { name = "esptool", specifier = ">=4.8" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-settings", specifier = ">=2.6" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "python-multipart", specifier = ">=0.0.12" },
+    { name = "pyudev", specifier = ">=0.24" },
+    { name = "rich", specifier = ">=13.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
     { name = "websockets", specifier = ">=13" },
 ]
